@@ -1,0 +1,155 @@
+#coding:utf-8
+import os
+import re
+import urllib2
+import shutil
+import pdb
+from socket import error as SocketError
+import errno
+
+root=r"/data/zwge/dataset/baidu_worm/images_test/"
+
+local_folder = ['samsung', 'lg', 'sony', 'tefal', 'cuckoo']
+key = ['LG手机','LG鼠标','LG显示器','LG键盘', 'LG净化器','LG空调','LG遥控器']  # 1900_iter0
+
+key_dict = {
+			local_folder[0]: ('samsung手机',
+							'samsung鼠标',
+							'samsung显示器',
+							'samsung键盘',
+							'samsung电脑',
+							'samsung打印机'),
+			local_folder[1]:('LG手机',
+							'LG鼠标',
+							'LG显示器',
+							'LG键盘',
+							'LG净化器',
+							'LG空调',
+							'LG遥控器'),
+			local_folder[2]:('sony手机',
+							'sony+DVD',
+							'sony相机',
+							'sony电视',
+							'sony遥控',
+							'sony鼠标',
+							'sony电子'),
+			local_folder[3]:('Tefal电饭',
+							'Tefal榨汁',
+							'Tefal不粘锅',
+							'Tefal水壶',
+							'Tefal料理',
+							'Tefal多用途',
+							'Tefal面包'),
+			local_folder[4]:('cuckoo电饭',
+							'cuckoo高压',
+							'cuckoo多功能',
+							'cuckoo料理',
+							'cuckoo福库',
+							'韩国福库',
+							'福库电器')
+			}
+
+
+name_txt=r'/data/zwge/dataset/baidu_worm/records/test_5cls.txt'
+num_save_max=1500 #百度最大的link 数量  爬虫的lib库 有bug，没有的link不能快速返回结果
+
+ext_list = ['jpg', 'JPG', 'JPEG', 'jpeg', 'bmp']
+
+
+def getHtml(url):
+    #response = urllib2.urlopen(url)
+    #html = response.read()
+
+    html = ''
+    try:
+        response = urllib2.urlopen(url)
+        html = response.read()
+    except SocketError as e:
+        if e.errno != errno.ECONNRESET:
+            raise # Not error we are looking for
+        pass
+
+    return html
+
+def getImg(html, page,temp_folder,cc,k):
+    reg = r'<a href=\"(.*?)\">原图'
+    imgre = re.compile(reg)
+    imglist = imgre.findall(html)
+    #print len(imglist)
+	
+    for imgurl in imglist:
+        re_imgurl = imgurl.replace('\\', "")
+	print page, re_imgurl	
+	try:
+	    imgdown = urllib2.urlopen(re_imgurl)
+	    img = imgdown.read()
+            name_ary = re_imgurl.strip("\n").split("/")
+            #print 'name = %s' %name
+            img_name = name_ary[len(name_ary)-1]
+			
+	    #fp = open(temp_folder+"%08d_%04d.jpg" % (page, page), "wb")
+            img_name_ext = img_name.strip("\n").split(".")
+            #print img_name_ext
+            if len(img_name_ext)<=1:
+                break
+
+            if not img_name_ext[len(img_name_ext)-1] in ext_list:
+                break
+
+	    fp = open(temp_folder+"%s" % (img_name), "wb")
+	    fp.write(img)
+	    fp.close()
+			
+	    fw=open(name_txt,'a+')
+	    fw.write(str(cc)+'\t'+str(k)+'\t'+str(page)+'\n')
+	    fw.close()
+			
+	except:
+	    continue
+	
+	
+if __name__ == "__main__":
+    proxy_handler = urllib2.ProxyHandler({'http' : 'http://109.105.1.52:8080'})
+    opener = urllib2.build_opener(proxy_handler)
+    urllib2.install_opener(opener)
+	
+    fr=open(name_txt,'r')
+    cc=0
+    key_save = 0
+    num_save=0
+    line_sp=''
+    for line in fr:
+        line_sp=line.strip().split()
+        #print line_sp
+    fr.close()	
+    if len(line_sp)==3:
+        cc=int(line_sp[0])
+        key_save=int(line_sp[1])
+	num_save=int(line_sp[2])   #这里需要加1 不然所有Python都要继续执行最后一次， 2017/02/25/14:18
+	
+	
+    biao1=0
+    #temp_folder=root+local_folder[0]+'/'
+	
+    for ii in range(cc,len(local_folder)):
+        print 'Search product is %s ' %local_folder[ii]
+        if biao1!=0:
+	    num_save=0
+        biao1+=1
+
+
+		# 先建立文件夹
+        temp_folder=root+local_folder[ii]+'/'
+	if os.path.exists(temp_folder)==0:
+	    shutil.os.mkdir(temp_folder)
+
+        for k in range(key_save, len(key_dict[local_folder[ii]])):
+            print 'Search key is %d ---> %s'%(k, key_dict[local_folder[ii]][k])
+	    for page in range(num_save, num_save_max):
+	        if page == num_save_max-1:
+	            break
+	        url = "http://image.baidu.com/i?tn=wisemiddetail&ie=utf8&word="+str(key_dict[local_folder[ii]][k])+"&pn=" + str(page)
+	        #print 'url = %s' %url
+	        html = getHtml(url)
+	        getImg(html, page,temp_folder,ii, k)
+
