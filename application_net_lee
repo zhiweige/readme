@@ -1,0 +1,172 @@
+import os
+import cv2
+import CaffeNet
+import exifread
+import random
+import caffe
+import time
+
+def isClassificationResult(position):
+  if len(position) == 4 and position[0] < 0 and position[1] < 0 and position[2] < 0 and position[3] < 0:
+    return True
+  return False
+            
+        
+#inputFolder = '/data/zijian.xu/DATA/NDID_testset/'
+#inputFolder = '/data/zijian.xu/caffe-ssd-bn/python/Multi-tag-evaluation-0930/test/'
+#inputFolder = '/data/zijian.xu/caffe-ssd-KHQ/models/landmark_delivery_1201/test/'
+inputFolder = '/data/zijian.xu/DATA/SQE_updated_testset/input_merged_refined_under20supplemented/'
+outputFolder = '/data/zx1228.li/CODE/caffe-standalone-exp/output/'
+
+ProjRoot = '/data/zx1228.li/CODE/caffe-standalone-exp/db/20170220/'
+caffeProto_cls = ProjRoot + 'caffeProto_cls.prototxt'
+caffeModel_cls = ProjRoot + 'caffeModel_cls.caffemodel'
+
+caffeProto_scenery = ProjRoot + 'caffeProto_scenery.prototxt'
+caffeModel_scenery = ProjRoot + 'caffeModel_scenery.caffemodel'
+svmModel_scenery = ProjRoot + 'svmModel_scenery.db'
+
+caffeProto_event = ProjRoot + 'caffeProto_event.prototxt'
+caffeModel_event = ProjRoot + 'caffeModel_event.caffemodel'
+
+caffeProto_detect = ProjRoot + 'ssd_merge.prototxt'
+caffeModel_detect = ProjRoot + 'ssd_merge.caffemodel'
+
+hierachyCategoryFile = ProjRoot + 'hierachyCategoryFile.txt'
+object_threshold_file = ProjRoot + 'object_threshold_file.txt'
+event_threshold_file = ProjRoot + 'event_threshold_file.txt'
+scenery_threshold_file = ProjRoot + 'scenery_threshold_file.txt'
+
+caffeProto_verification = ProjRoot + 'caffeProto_verification.prototxt'
+caffeModel_verification = ProjRoot + 'caffeModel_verification.caffemodel'
+svmModel_verification = ProjRoot + 'svmModel_verification.db'
+thresholdFile_verification = ProjRoot + 'thresholdFile_verification.txt'
+detect_200_threshold = ProjRoot + 'detect_200_threshold.txt'
+
+id2strFile = ProjRoot + "id2strFile.txt"
+#config log path and level
+log_output_path = ProjRoot
+log_level = 3
+
+#use a config map to pass all model files
+configMap = {
+  'caffeProto_cls':caffeProto_cls,
+  'caffeModel_cls':caffeModel_cls,
+  'caffeProto_scenery':caffeProto_scenery,
+  'caffeModel_scenery':caffeModel_scenery,
+  'svmModel_scenery':svmModel_scenery,
+  'caffeProto_event':caffeProto_event,
+  'caffeModel_event':caffeModel_event,
+  'caffeProto_detect':caffeProto_detect,
+  'caffeModel_detect':caffeModel_detect,
+  'hierachyCategoryFile':hierachyCategoryFile,
+  'object_threshold_file':object_threshold_file,
+  'event_threshold_file':event_threshold_file,
+  'scenery_threshold_file':scenery_threshold_file,
+  'caffeProto_verification':caffeProto_verification,
+  'caffeModel_verification':caffeModel_verification,
+  'svmModel_verification':svmModel_verification,
+  'thresholdFile_verification':thresholdFile_verification,
+  'detect_200_threshold':detect_200_threshold,
+  'id2strFile':id2strFile,
+  'log_output_path':log_output_path,
+  'log_level':log_level,
+  }
+
+#GPU mode 
+net = CaffeNet.CaffeNet(configMap, mode = 'GPU')
+net.set_gpu_device(3)
+
+count = 0
+for dirpath, subfolders, filenames in os.walk(inputFolder):
+  for filename in filenames:
+    whole_start=time.time()
+    print "Processing image: " + filename + '(' + str(count) + ')',
+    inputImage = dirpath + '/' + filename
+    try:
+      inputs = caffe.io.load_image(inputImage)
+      image = cv2.imread(inputImage)
+    except:
+      continue
+
+    # Return Exif tags
+    try:      
+      filer = open(inputImage, 'rb')
+      tags = exifread.process_file(filer)
+      if 'Image Orientation' in tags.keys():
+        if str(tags['Image Orientation']) == 'Rotated 90 CW':
+          inputs = np.fliplr(np.transpose(inputs, (1, 0, 2)))
+          image = cv2.transpose(image)        
+          image = cv2.flip(image, 1)
+        if str(tags['Image Orientation']) == 'Rotated 90 CCW':
+          inputs = np.flipud(np.transpose(inputs, (1, 0, 2)))
+          image = cv2.transpose(image)        
+          image = cv2.flip(image, 0)
+        if str(tags['Image Orientation']) == 'Rotated 180':
+          inputs = np.fliplr(np.flipud(inputs))    
+          image = cv2.flip(image, 1)
+          image = cv2.flip(image, 0)
+      filer.close()   
+    except:
+      pass
+
+    classificationInfo, _ = net.classify(inputs)
+    classificationInfo = net.translateCategoryName(classificationInfo)
+
+    # Information for result display
+    height = image.shape[0]
+    width = image.shape[1]
+    line_thickness = min(max(int(0.006*width), 2),255)
+    font_scale = max(0.5, float(0.5*0.005*width*0.5))
+    offset_text = max(int(15*0.5*0.005*width),15)
+    
+    clsResult = []
+    outputString = ''
+    visitedList = []
+    flatCounter = 1
+    
+    if classificationInfo != 'None':
+      for info in classificationInfo:      
+        if isClassificationResult(info[1]):
+          clsResult.append((info[0], info[2]))
+          outputString += '%' + info[0]
+          text = '%s %.04f'%(info[0].split('#')[-1], info[2])
+          cv2.putText(image, text, (offset_text, offset_text*flatCounter), 0, font_scale, (0, 0, 255), line_thickness)
+          flatCounter += 1
+      
+      for info in classificationInfo:      
+        if not isClassificationResult(info[1]):
+          visitedList.append((info[0], info[2]))
+          outputString += '@' + info[0]
+          colour = (int(random.random()*255), int(random.random()*255), int(random.random()*255))
+          cv2.rectangle(image, (int(info[1][0]*width), int(info[1][1]*height)), (int(info[1][2]*width), int(info[1][3]*height)), colour, line_thickness)
+          cv2.putText(image, info[0].split('#')[-1], (int(info[1][0]*width)+offset_text, int(info[1][1]*height)+offset_text), 0, font_scale, colour, line_thickness)
+          text = 'bbox:%.04f'%(info[2])
+          cv2.putText(image, text, (int(info[1][0]*width)+offset_text, int(info[1][1]*height)+offset_text*2), 0, font_scale, colour, line_thickness)
+          
+      if len(clsResult) != 0: 
+        visitedList.extend(clsResult)
+    
+      flag = True   
+      while flag:
+         (visitedList, flag) = net.duplicateRemoval(visitedList) 
+    
+    if outputString == '':
+      outputString = 'None'
+    print ' ' + outputString
+    
+    for result in visitedList:
+      leafCategory = result[0].split('#')[-1]      
+      fileName = '%.04f_%d.jpg' %(result[1], count)
+      try:
+        os.mkdir(outputFolder + '/' + leafCategory)
+      except:
+        pass  
+      filePath = outputFolder + '/' + leafCategory + '/' + fileName
+      print "Saving to " + filePath
+      #open(filePath, "wb").write(open(imagePath + '/' + imageName, "rb").read()) # Save original image
+      #cv2.imwrite(filePath, image) 
+
+    count += 1
+    whole_end=time.time()
+    #print("%.2f" % (whole_end - whole_start))
