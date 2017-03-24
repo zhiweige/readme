@@ -1,0 +1,850 @@
+import sys
+import numpy as np
+import skimage
+import os
+import struct
+import cv2
+import math
+import CategoryForest
+from progressbar import *
+
+ProjRoot = '/data/zijian.xu/caffe-ssd-bn/python/'
+sys.path.append(ProjRoot)  
+import caffe
+
+from ctypes import create_string_buffer
+
+class CaffeNet:
+  
+  __maxGroupSize = 2000
+  __maxGroupid = 0
+  __imgGroups = []
+  __clusterFeatureNum = 2048
+  __time_interval = 300000  #5min
+  __sim_thr_low = 0.75
+  __sim_thr_high = 0.85
+  maxInteger = 0x7FFFFFFF
+  
+  def __isClassificationResult(self, position):
+    if len(position) == 4 and position[0] < 0 and position[1] < 0 and position[2] < 0 and position[3] < 0:
+      return True
+    return False
+  
+  def __findSingleCategory(self, backgroundFlag):
+    bufferMap = {}
+    for i in xrange(len(backgroundFlag)):
+      if backgroundFlag[i] not in bufferMap:
+        bufferMap[backgroundFlag[i]] = i
+      else:
+        bufferMap[backgroundFlag[i]] = -1
+    
+    projectionMap = {}
+    for key,value in bufferMap.items():
+      if value != -1:
+        projectionMap[key] = value
+    return projectionMap
+  
+  def __ruleForMonitor(self, infoMap):
+    hasMonitor = False
+    for info in infoMap:
+      if self.__isClassificationResult(info[1]): 
+        category = info[0].split('#')[-1]
+        if category == '1100010011' or category == '1100010005' or category == '1100010013':
+          hasMonitor = True
+          break
+    
+    if not hasMonitor:
+      return infoMap
+    
+    #remove TV label from detection results
+    infoMap_new = []
+    for info in infoMap:
+      category = info[0].split('#')[-1]
+      if self.__isClassificationResult(info[1]) or (category != '1100010002' and category != '1100010011' and category != '1100010005' and category != '1100010013'):
+        infoMap_new.append(info)
+    
+    return infoMap_new
+  
+  def __ruleForViolin(self, infoMap):
+    hasDetectViolin = False
+    hasDetectCello = False  
+    
+    for info in infoMap:
+      if not self.__isClassificationResult(info[1]): 
+        category = info[0].split('#')[-1]
+        if category == '1100020013':
+          hasDetectCello = True 
+        if category == '1100020001':
+          hasDetectViolin = True
+    
+    if (not hasDetectViolin) and (not hasDetectCello):
+      return infoMap
+    
+    #remove Cello label from classifiaction results
+    infoMap_new = []
+    for info in infoMap:
+      category = info[0].split('#')[-1]
+      if (not self.__isClassificationResult(info[1])) or (category != '1100020013' and category != '1100020001'):
+        infoMap_new.append(info)
+    
+    return infoMap_new
+  
+
+  def cluster(self, feature, ltime):
+    maxSimilarity = -1
+    maxIndex = -1
+    
+    for i in xrange(len(self.__imgGroups)):
+      similarity = feature.dot(self.__imgGroups[i]["centroid"]) / np.linalg.norm(feature) / np.linalg.norm(self.__imgGroups[i]["centroid"])
+      if similarity > maxSimilarity:
+        maxSimilarity = similarity
+        maxIndex = i
+        
+    # adapt information from timestamp    
+    ltimeNearest = 1000000000  
+    if ltime != 0 and maxIndex >= 0 and len(self.__imgGroups[maxIndex]["ltime"]) != 0:
+      for j in xrange(len(self.__imgGroups[maxIndex]["ltime"])):
+        timeSub = abs(ltime - self.__imgGroups[maxIndex]["ltime"][j])
+        if ltimeNearest > timeSub:
+          ltimeNearest = timeSub
+            
+    if ltimeNearest < self.__time_interval:
+      SIM_threshold = self.__sim_thr_low
+    else:
+      SIM_threshold = self.__sim_thr_high
+    
+    if maxSimilarity > SIM_threshold:
+      # add input image to an exisited group
+      listNum = self.__imgGroups[maxIndex]["listNum"]
+      self.__imgGroups[maxIndex]["centroid"] = (self.__imgGroups[maxIndex]["centroid"] * listNum + feature) / (listNum+1)
+      self.__imgGroups[maxIndex]["listNum"] += 1
+      if ltime != 0:
+        self.__imgGroups[maxIndex]["ltime"].append(ltime)
+      classID = maxIndex
+    else:
+      imgGroupSize = len(self.__imgGroups)
+      # add a new group
+      if imgGroupSize < self.__maxGroupSize:
+        group = {}
+        group["cls_id"] = imgGroupSize
+        group["listNum"] = 1
+        group["ltime"] = [ltime]
+        group["updated"] = False
+        group["centroid"] = feature
+        self.__imgGroups.append(group)
+        classID = group["cls_id"]
+      else:
+        #find the group to be replaced
+        updatedIndex = 0
+        for j in xrange(imgGroupSize):
+          if not self.__imgGroups[j]["updated"]:
+            updatedIndex = j
+            break
+            
+        group = {}
+        if self.__maxGroupid < imgGroupSize:
+          self.__maxGroupid = imgGroupSize - 1
+        if self.__maxGroupid >= 0 and self.__maxGroupid < self.maxInteger:
+          self.__maxGroupid += 1
+        else:
+          self.__maxGroupid = 0
+        group["cls_id"] = self.__maxGroupid % self.maxInteger
+        group["listNum"] = 1
+        group["ltime"] = [ltime]
+        group["updated"] = True
+        group["centroid"] = feature
+        
+        self.__imgGroups[updatedIndex] = group
+        classID = group["cls_id"]
+        
+        if updatedIndex == self.__maxGroupSize - 1:
+          for j in xrange(imgGroupSize):
+            self.__imgGroups[j]["updated"] = False
+                
+    return classID
+  
+  def __init__(self, configMap, mode = 'CPU'):
+    
+    print 'Initialization start.'
+    
+    caffe.init_log_info(configMap['log_level'], configMap['log_output_path'])
+    
+    widgets = ['Progress: ', Percentage(), ' ', Bar(marker=RotatingMarker('>-=')),
+      ' ', Timer()]
+    pbar = ProgressBar(widgets=widgets).start()
+    
+    self.__mean_cls = np.array([123.68, 116.779, 103.939])  #RGB order
+    self.__mean_event = np.array([123, 117, 104])  #RGB order
+    self.__backgroundResizeLength = 256
+    self.__ObjectResizeLength = 224
+    
+    channel_swap = '2,1,0'
+    channel_swap = [int(s) for s in channel_swap.split(',')]
+    
+    self.__classifier_cls = caffe.Classifier(configMap['caffeProto_cls'], configMap['caffeModel_cls'], channel_swap=channel_swap)
+    pbar.update(15)
+    
+    self.__classifier_scenery = caffe.Classifier(configMap['caffeProto_scenery'], configMap['caffeModel_scenery'], channel_swap=channel_swap, svm_name = ['svm'], svm_path = [configMap['svmModel_scenery']]) 
+    pbar.update(30)
+
+    self.__classifier_event = caffe.Classifier(configMap['caffeProto_event'], configMap['caffeModel_event'], channel_swap=channel_swap)
+    pbar.update(45)
+
+    #detect_initialization
+    self.__mean_detect = np.array([104, 117, 123])  #BGR order
+    images_dim_detect = '300,300'
+    image_dims_detect = [int(s) for s in images_dim_detect.split(',')]
+    self.__classifier_detect = caffe.Classifier(configMap['caffeProto_detect'], configMap['caffeModel_detect'],
+            image_dims=image_dims_detect, mean=self.__mean_detect,
+            raw_scale=255.0, channel_swap=channel_swap)
+    pbar.update(65)
+
+    self.__hierachyCategoryList = []
+    filer = open(configMap['hierachyCategoryFile'], 'r')
+    for line in filer.readlines():
+      splits = line.strip().split('\t')
+      self.__hierachyCategoryList.append(splits)
+    filer.close()
+    pbar.update(70)
+    
+    self.__backgroundFlag = []
+    self.__threshold_object = []
+    filer = open(configMap['object_threshold_file'], 'r')
+    for line in filer.readlines():
+      splits = line.strip().split('\t')
+      self.__backgroundFlag.append(int(splits[1]))
+      self.__threshold_object.append(float(splits[2]))
+    filer.close()
+    
+    self.__threshold_event = []
+    filer = open(configMap['event_threshold_file'], 'r')
+    for line in filer.readlines():
+      splits = line.strip().split('\t')
+      self.__threshold_event.append((splits[0:-1], float(splits[-1])))
+    filer.close()
+    
+    self.__threshold_scenery = []
+    filer = open(configMap['scenery_threshold_file'], 'r')
+    for line in filer.readlines():
+      splits = line.strip().split('\t')
+      self.__threshold_scenery.append((splits[0:-1], float(splits[-1])))
+    filer.close()
+    pbar.update(75)
+    
+    self.__threshold_detect_200 = []
+    filer = open(configMap['detect_200_threshold'], 'r')
+    for line in filer.readlines():
+      splits = line.strip().split('\t')
+      self.__threshold_detect_200.append((splits[0:-1], float(splits[-1])))
+    filer.close()
+    pbar.update(80)
+
+    #detection_verification initialization
+    self.__mean_verification = np.array([123, 117, 104])  #RGB order
+    self.__backgroundResizeLength_verification = 128
+    self.__ObjectResizeLength_verification = 112
+    self.__classifier_verification = caffe.Classifier(configMap['caffeProto_verification'], configMap['caffeModel_verification'], channel_swap=channel_swap, svm_name = ['svm'], svm_path = [configMap['svmModel_verification']])
+    pbar.update(95)
+
+    #load threshold file for verification
+    self.__threshold_verification = []
+    filer = open(configMap['thresholdFile_verification'], 'r')
+    for line in filer.readlines():
+      splits = line.strip().split(':')
+      self.__threshold_verification.append((splits[0], int(splits[1]), float(splits[2])))
+    filer.close()          
+    
+    self.__singleSubcategoryMap = self.__findSingleCategory(self.__backgroundFlag)  #a map which can map detection category index to the corresponding category index in server model
+    
+    #load translation map
+    self.__id2stringMap = {}
+    filer = open(configMap['id2strFile'], 'r')
+    for line in filer.readlines():
+      splits = line.strip().split('\t')
+      self.__id2stringMap[splits[0]] = splits[1] 
+    filer.close()   
+       
+    if mode == 'CPU':
+      caffe.set_mode_cpu()
+    elif mode == 'GPU':
+      caffe.set_mode_gpu()
+    else:
+      raise Exception("Must assigned mode as 'CPU' or 'GPU'.")
+    
+    self.__mode = mode
+    
+    pbar.finish()
+    print "Finish loading model."
+  
+  def initClustering(self, clusterFeatureFile):
+    print "Initializing clustering process.",
+    self.__imgGroups = []
+    self.__maxGroupid = 0
+    
+    if os.path.exists(clusterFeatureFile):
+      filer = open(clusterFeatureFile, 'rb')
+      imgGroupsSize, = struct.unpack("i",filer.read(4))
+      for i in xrange(imgGroupsSize):
+        group = {}
+        group["cls_id"], = struct.unpack("i",filer.read(4))
+        if group["cls_id"] > self.__maxGroupid:
+          __maxGroupid = group["cls_id"]
+        self.__clusterFeatureNum, = struct.unpack("i",filer.read(4))
+        group["centroid"] = np.zeros(self.__clusterFeatureNum)
+        for j in xrange(self.__clusterFeatureNum):
+          group["centroid"][j], = struct.unpack("f",filer.read(4))
+                       
+        imgListSize, = struct.unpack("i",filer.read(4))
+        group["listNum"] = imgListSize
+        
+        group["ltime"] = []   
+        ltimeSize, = struct.unpack("i",filer.read(4))
+        for j in xrange(ltimeSize):
+          ltime, = struct.unpack("q",filer.read(8))
+          group["ltime"].append(ltime)
+        group["updated"], = struct.unpack("?",filer.read(1))
+        self.__imgGroups.append(group)
+      filer.close()
+    print " Finshed."
+    
+  def initClusteringWithBinary(self, dataStream):
+    print "Initializing clustering process.",
+    self.__imgGroups = []
+    self.__maxGroupid = 0
+    
+    if dataStream == "":
+      print " Finshed."
+      return
+
+    offset = 0
+    imgGroupsSize, = struct.unpack_from("i",dataStream,offset)
+    offset += 4
+    
+    for i in xrange(imgGroupsSize):
+      group = {}
+      group["cls_id"], = struct.unpack_from("i",dataStream,offset)
+      offset += 4
+      if group["cls_id"] > self.__maxGroupid:
+        __maxGroupid = group["cls_id"]
+      self.__clusterFeatureNum, = struct.unpack_from("i",dataStream,offset)
+      offset += 4
+      group["centroid"] = np.zeros(self.__clusterFeatureNum)
+      for j in xrange(self.__clusterFeatureNum):
+        group["centroid"][j], = struct.unpack_from("f",dataStream,offset)
+        offset += 4
+                    
+      imgListSize, = struct.unpack_from("i",dataStream,offset)
+      offset += 4
+      group["listNum"] = imgListSize
+
+      group["ltime"] = []  
+      ltimeSize, = struct.unpack_from("i",dataStream,offset)
+      offset += 4
+      for j in xrange(ltimeSize):
+        ltime, = struct.unpack_from("q",dataStream,offset)
+        offset += 8
+        group["ltime"].append(ltime)
+      group["updated"], = struct.unpack_from("?",dataStream,offset)
+      offset += 1
+      self.__imgGroups.append(group)
+      
+    print " Finshed."
+       
+  def saveClusterFeature(self, clusterFeatureFile):
+    print "Saving clustering process.",
+    if len(self.__imgGroups) > 0:
+      filew = open(clusterFeatureFile, 'wb')
+      filew.write(struct.pack("i", len(self.__imgGroups)))   
+      for i in xrange(len(self.__imgGroups)):
+        imgListSize = self.__imgGroups[i]["listNum"]
+        if imgListSize == 0:
+          continue
+        filew.write(struct.pack("i", self.__imgGroups[i]["cls_id"]))   
+        filew.write(struct.pack("i", self.__clusterFeatureNum))
+        for j in xrange(self.__clusterFeatureNum):
+          filew.write(struct.pack("f", self.__imgGroups[i]["centroid"][j]))
+          
+        filew.write(struct.pack("i", imgListSize))
+        
+        filew.write(struct.pack("i", len(self.__imgGroups[i]["ltime"])))
+        for j in xrange(len(self.__imgGroups[i]["ltime"])):
+          filew.write(struct.pack("q", self.__imgGroups[i]["ltime"][j]))
+          
+        filew.write(struct.pack("?", self.__imgGroups[i]["updated"]))
+        
+      filew.close()
+    print " Finshed."
+  
+  def outputClusterDataStream(self):
+    #able to output data less than ~100MB, the code will be broken down when user try to write more than 100MB data
+    #another way to write it is check offset less then 100MB everytime, then the code will be ugly
+    data = create_string_buffer(100000000)
+    if len(self.__imgGroups) > 0:
+      offset = 0
+      struct.pack_into("i",data,offset,len(self.__imgGroups))
+      offset += 4
+      for i in xrange(len(self.__imgGroups)):
+        imgListSize = self.__imgGroups[i]["listNum"]
+        if imgListSize == 0:
+          continue
+        struct.pack_into("i",data,offset,self.__imgGroups[i]["cls_id"])
+        offset += 4
+        struct.pack_into("i",data,offset,self.__clusterFeatureNum)
+        offset += 4
+        for j in xrange(self.__clusterFeatureNum):
+          struct.pack_into("f",data,offset,self.__imgGroups[i]["centroid"][j])
+          offset += 4
+
+        struct.pack_into("i",data,offset,imgListSize)
+        offset += 4
+             
+        struct.pack_into("i",data,offset,len(self.__imgGroups[i]["ltime"]))
+        offset += 4
+        for j in xrange(len(self.__imgGroups[i]["ltime"])):
+          struct.pack_into("q",data,offset,self.__imgGroups[i]["ltime"][j])
+          offset += 8
+        struct.pack_into("?",data,offset,self.__imgGroups[i]["updated"])
+        offset += 1
+    return data.raw[:offset]
+  
+  def __getCategoryName(self, id):
+    return self.__id2stringMap[id]
+  
+  def translateCategoryName(self, classificationInfo):
+    if classificationInfo == 'None':
+      return 'None'
+    
+    infoMap_en = []
+    for info in classificationInfo:
+      categoryString = ''
+      splits = info[0].split('#')
+      for i in xrange(len(splits)-1):
+        categoryString += self.__getCategoryName(splits[i]) + '#'
+      categoryString += self.__getCategoryName(splits[-1])
+      infoMap_en.append((categoryString, info[1], info[2]))
+    return infoMap_en
+    
+  # Order of channels of input images should be RGB
+  
+  def __resize_for_classifyFeatures(self, image):
+    img_background = cv2.resize((image*255).astype(np.uint8), (self.__backgroundResizeLength, self.__backgroundResizeLength)).astype(np.float32)
+    img_background -= self.__mean_cls
+    cx = (img_background.shape[1]-self.__ObjectResizeLength)/2
+    cy = (img_background.shape[0]-self.__ObjectResizeLength)/2
+    
+    return img_background[cy:cy+self.__ObjectResizeLength, cx:cx+self.__ObjectResizeLength, :]
+  
+  def __classifyFeatures(self, image, blobList = []):
+    if type(image) != np.ndarray:
+      raise Exception('Type of input image should be ndarray')
+    if image.ndim != 3:
+      raise Exception('Input should be 3 channels image, but only have ' + str(image.ndim) + 'channel(s)')
+      
+    img_input_crop = self.__resize_for_classifyFeatures(image)    
+    featureAndProb_cls = self.__classifier_cls.predict_features([img_input_crop], blobList) #object    
+    out = self.__classifier_scenery.predict([img_input_crop], False)  #scenery    
+    #print out
+    scores_scenery = out[0]
+
+    return (featureAndProb_cls,scores_scenery)
+    
+  def __overlapRatio(self, a, b):
+    x0 = max(a['x0'], b['x0'])
+    y0 = max(a['y0'], b['y0'])
+    x1 = min(a['x1'], b['x1'])
+    y1 = min(a['y1'], b['y1'])
+    if x0<x1 and y0<y1:
+      return float((x1-x0+1)*(y1-y0+1))/float((a['x1']-a['x0']+1)*(a['y1']-a['y0']+1) + (b['x1']-b['x0']+1)*(b['y1']-b['y0']+1) - (x1-x0+1)*(y1-y0+1))
+    else:
+      return 0
+  
+  def __mergeBndBox(self, a_box, box_list):
+    for b_box in box_list:
+      overlap_ratio = self.__overlapRatio(a_box, b_box)
+      
+      if a_box['cat']==192 or a_box['cat']==40:  # violin & cello
+        is_same_cat = (b_box['cat'] == 15)
+      else:
+        is_same_cat = True
+      
+      if overlap_ratio > 0.50 and is_same_cat:
+        return True
+    return False
+    
+  def __resize_for_event(self, image):
+    img_background = cv2.resize((image*255).astype(np.uint8), (self.__backgroundResizeLength, self.__backgroundResizeLength)).astype(np.float32)
+    img_background -= self.__mean_event
+    cx = (img_background.shape[1]-self.__ObjectResizeLength)/2
+    cy = (img_background.shape[0]-self.__ObjectResizeLength)/2
+    return img_background[cy:cy+self.__ObjectResizeLength, cx:cx+self.__ObjectResizeLength, :]
+  
+  def __resize_for_verificaton(self, img_sub_crop):    
+     
+    img_verification = cv2.resize((img_sub_crop*255).astype(np.uint8),( self.__backgroundResizeLength_verification, self.__backgroundResizeLength_verification)).astype(np.float32)
+    img_verification -=  self.__mean_verification
+    cx = (img_verification.shape[1]- self.__ObjectResizeLength_verification)/2
+    cy = (img_verification.shape[0]- self.__ObjectResizeLength_verification)/2
+    return img_verification[cy:cy+ self.__ObjectResizeLength_verification, cx:cx+ self.__ObjectResizeLength_verification, :]
+    
+          
+  def classify(self, image):
+    addedBlob = ['pool5/7x7_s1', 'prob']
+    #start = time.time() #start    
+    (featureAndProb_cls,scores_scenery) = self.__classifyFeatures(image, addedBlob)
+    #end=time.time() #end
+    #print("%.2f" % (end - start)),
+    
+    feature = np.zeros(self.__clusterFeatureNum)
+    for i in xrange(self.__clusterFeatureNum):
+      feature[i] = featureAndProb_cls['pool5/7x7_s1'][0][i]
+
+    if len(featureAndProb_cls['prob'][0]) != len(self.__threshold_object):
+      raise Exception('Dimension of output is not compatible with category list.')
+        
+    predictions_cls = featureAndProb_cls['prob'] #object classification
+    cls_result_index = np.argsort(predictions_cls[0])[-1]
+    
+    #event prediction
+    img_input_crop = self.__resize_for_event(image)
+    #event_start = time.time()#start
+    predictions_event = self.__classifier_event.predict([img_input_crop], False)
+    #event_end = time.time()
+    #print("%.2f" % (event_end - event_start)),#end
+    
+    event_result_index = np.argsort(predictions_event[0])[-1]
+
+    height = image.shape[0]
+    width = image.shape[1]
+    
+    visitedList = []
+    positionList = []
+    confidenceScore = []
+    #object
+    if predictions_cls[0][cls_result_index] > self.__threshold_object[cls_result_index]:
+      classification_info = self.__printOverall(self.__hierachyCategoryList[cls_result_index], 5)
+      visitedList.append(self.__dictToStringOverall(classification_info))
+      positionList.append((-1,-1,-1,-1))
+      confidenceScore.append(predictions_cls[0][cls_result_index])
+    elif predictions_cls[0][cls_result_index] > 0.3:     
+      classification_info = self.__printOverall(self.__hierachyCategoryList[cls_result_index], 1)
+      visitedList.append(self.__dictToStringOverall(classification_info))
+      positionList.append((-1,-1,-1,-1))
+      confidenceScore.append(predictions_cls[0][cls_result_index])
+    
+    #event
+    eventResult = ''
+    if predictions_event[0][event_result_index] > max(self.__threshold_event[event_result_index][-1], 0.5):
+      event_info = self.__printOverall(self.__threshold_event[event_result_index][0], 5)
+      eventResult = (self.__dictToStringOverall(event_info), (-1,-1,-1,-1), predictions_event[0][event_result_index])
+    
+    #scenery
+    for i in xrange(len(scores_scenery)):
+      if scores_scenery[i] > self.__threshold_scenery[i][-1]:
+        scenery_info = self.__printOverall(self.__threshold_scenery[i][0], 5)
+        visitedList.append(self.__dictToStringOverall(scenery_info))
+        positionList.append((-1,-1,-1,-1))
+        confidenceScore.append(1.0/(1+np.exp(self.__threshold_scenery[i][-1]-scores_scenery[i])))
+    
+    #ssd_coco and ssd_detect200
+    addedBlob_detect = ['detection_out_coco', 'detection_out']
+    detect_start = time.time()#start
+    predictions_detect_merge = self.__classifier_detect.predict_features([image], addedBlob_detect)
+    detect_end = time.time()
+    #print("%.2f" % (detect_end - detect_start)),#end
+    
+    #detection  
+    predictions_detect = predictions_detect_merge['detection_out_coco']
+
+    curr_img_box = []
+    hasPerson = False  
+    for i in xrange(predictions_detect[0].shape[1]):
+      if predictions_detect[0][0,i,2] >= 0.3:
+        curr_img_box.append(
+                  {'x0': int(predictions_detect[0][0,i,3] * width), 
+                   'y0': int(predictions_detect[0][0,i,4] * height), 
+                   'x1': int(predictions_detect[0][0,i,5] * width),  
+                   'y1': int(predictions_detect[0][0,i,6] * height), 
+                   's': predictions_detect[0][0,i,2], 
+                   'cat': int(predictions_detect[0][0,i,1]), 
+                   'x0_norm': predictions_detect[0][0,i,3], 
+                   'y0_norm': predictions_detect[0][0,i,4], 
+                   'x1_norm': predictions_detect[0][0,i,5],  
+                   'y1_norm': predictions_detect[0][0,i,6],
+                   })
+    
+    maximumBoundingBox = 3
+    boundingBoxCounter = 0
+
+    #need sort all boxes
+    curr_img_box.sort(key=lambda x:-x['s'])
+    
+    img_box_coco = []
+    for box in curr_img_box:
+       if box['s'] < 0.3:
+           continue
+       
+       if boundingBoxCounter == maximumBoundingBox:
+         break
+       boundingBoxCounter += 1
+       
+       ratio = 0.2
+       bbox_width = box['x1'] - box['x0']
+       bbox_height = box['y1'] - box['y0']
+       
+       if bbox_width < 0.3*width or bbox_height < 0.3*height:
+         continue
+       
+       if bbox_width > bbox_height:
+         bbox_height = bbox_width
+       else:
+         bbox_width = bbox_height
+         
+       extend_x0 = box['x0'] - bbox_width * ratio if box['x0'] - bbox_width * ratio > 0 else 0
+       extend_x1 = box['x1'] + bbox_width * ratio if box['x1'] + bbox_width * ratio < width else width - 1
+       extend_y0 = box['y0'] - bbox_height * ratio if box['y0'] - bbox_height * ratio > 0 else 0
+       extend_y1 = box['y1'] + bbox_height * ratio if box['y1'] + bbox_height * ratio < height else height - 1
+       
+       extend_x = extend_x1 - extend_x0
+       extend_y = extend_y1 - extend_y0
+       delta = extend_x - extend_y
+       if delta > 0:
+         extend_y0 = extend_y0 - delta * 0.5 if extend_y0 - delta * 0.5 > 0 else 0
+         extend_y1 = extend_y1 + delta * 0.5 if extend_y1 + delta * 0.5 < height else height
+       else:
+         delta = -delta
+         extend_x0 = extend_x0 - delta * 0.5 if extend_x0 - delta * 0.5 > 0 else 0
+         extend_x1 = extend_x1 + delta * 0.5 if extend_x1 + delta * 0.5 < width else width
+         
+       extend_x0 = int(extend_x0)
+       extend_x1 = int(extend_x1)
+       extend_y0 = int(extend_y0)
+       extend_y1 = int(extend_y1)
+       
+       #add manual crop
+       img_sub_crop = image[extend_y0:extend_y1, extend_x0:extend_x1, :]
+       img_verification = self.__resize_for_verificaton(img_sub_crop)
+       #veri_start = time.time()#start
+       out = self.__classifier_verification.predict([img_verification], False)  #verif
+       #veri_end = time.time()
+       #print("%.2f" % (veri_start - veri_end)), #end
+       scores_verification = out[0]
+       
+       verList = []
+       for i in xrange(len(scores_verification)):
+         if scores_verification[i] > self.__threshold_verification[i][2]:
+           verList.append(self.__threshold_verification[i][1])
+       
+       if box['cat'] not in verList:  #verification failed
+         continue
+                      
+       if box['cat'] == 1:
+         hasPerson = True
+
+       if box['cat'] in self.__singleSubcategoryMap:
+         sub_crop_cls_index = self.__singleSubcategoryMap[box['cat']]
+         classification_info = self.__printOverall(self.__hierachyCategoryList[sub_crop_cls_index], 5)
+         visitedList.append(self.__dictToStringOverall(classification_info))
+         positionList.append((box['x0_norm'],box['y0_norm'],box['x1_norm'],box['y1_norm']))
+         confidenceScore.append(box['s'])
+       else:
+         #img_detect_crop = cv2.resize((img_sub_crop*255).astype(np.uint8),(self.__backgroundResizeLength,self.__backgroundResizeLength)).astype(np.float32)
+         #img_detect_crop -= self.__mean_cls
+         #cx = (img_detect_crop.shape[1]-self.__ObjectResizeLength)/2
+         #cy = (img_detect_crop.shape[0]-self.__ObjectResizeLength)/2
+         #img_detect_crop = img_detect_crop[cy:cy+self.__ObjectResizeLength, cx:cx+self.__ObjectResizeLength, :]  
+         img_detect_crop = self.__resize_for_classifyFeatures(img_sub_crop)
+         #sub_start = time.time()#start
+         sub_crop_cls = self.__classifier_cls.predict_features([img_detect_crop], ['loss/classifier_object'])
+         #sub_end = time.time()
+         #print("%.2f" % (sub_end - sub_start)), #end
+         sub_score_cls = np.zeros(len(sub_crop_cls['loss/classifier_object'][0]))
+         for i in xrange(len(self.__backgroundFlag)):
+           if self.__backgroundFlag[i] != box['cat']:
+             sub_score_cls[i] = -500
+           else:
+             sub_score_cls[i] = sub_crop_cls['loss/classifier_object'][0][i]
+          
+         #normalize
+         sum = 0
+         for i in xrange(len(self.__backgroundFlag)):
+           if sub_score_cls[i] != -500:
+             sub_score_cls[i] = math.exp(sub_score_cls[i])
+             sum += sub_score_cls[i]
+         
+         sub_score_cls /= sum
+         
+         sub_crop_cls_index = np.argsort(sub_score_cls)[-1]
+         
+         #rules for output tags
+         if sub_score_cls[sub_crop_cls_index] < self.__threshold_object[sub_crop_cls_index]:
+           continue
+         elif sub_crop_cls_index == 1005 or sub_crop_cls_index == 1017:  #violin, cello
+           continue
+         elif sub_crop_cls_index == 348 or sub_crop_cls_index == 349:  #barcode, qrcode
+           continue
+         elif box['cat'] == 15:  #instrument
+           if sub_score_cls[sub_crop_cls_index] > 0.5:
+             classification_info = self.__printOverall(self.__hierachyCategoryList[sub_crop_cls_index], 5)
+             visitedList.append(self.__dictToStringOverall(classification_info))
+             positionList.append((box['x0_norm'],box['y0_norm'],box['x1_norm'],box['y1_norm']))
+             confidenceScore.append(sub_score_cls[sub_crop_cls_index])
+         elif box['cat'] == 7:  #food
+           if sub_score_cls[sub_crop_cls_index] > 0.7:
+             classification_info = self.__printOverall(self.__hierachyCategoryList[sub_crop_cls_index], 5)
+             visitedList.append(self.__dictToStringOverall(classification_info))
+             positionList.append((box['x0_norm'],box['y0_norm'],box['x1_norm'],box['y1_norm']))
+             confidenceScore.append(sub_score_cls[sub_crop_cls_index])
+           elif sub_score_cls[sub_crop_cls_index] > 0.3:
+             classification_info = self.__printOverall(self.__hierachyCategoryList[sub_crop_cls_index], 1)
+             visitedList.append(self.__dictToStringOverall(classification_info))
+             positionList.append((box['x0_norm'],box['y0_norm'],box['x1_norm'],box['y1_norm']))
+             confidenceScore.append(sub_score_cls[sub_crop_cls_index])
+         elif box['cat'] == 16:  #building
+           if sub_score_cls[sub_crop_cls_index] > 0.7:
+             classification_info = self.__printOverall(self.__hierachyCategoryList[sub_crop_cls_index], 5)
+             visitedList.append(self.__dictToStringOverall(classification_info))
+             positionList.append((box['x0_norm'],box['y0_norm'],box['x1_norm'],box['y1_norm']))
+             confidenceScore.append(sub_score_cls[sub_crop_cls_index])
+           elif sub_score_cls[sub_crop_cls_index] > 0.2:
+             classification_info = self.__printOverall(self.__hierachyCategoryList[sub_crop_cls_index], 1)
+             visitedList.append(self.__dictToStringOverall(classification_info))
+             positionList.append((box['x0_norm'],box['y0_norm'],box['x1_norm'],box['y1_norm']))
+             confidenceScore.append(sub_score_cls[sub_crop_cls_index])
+         else:  
+           if sub_score_cls[sub_crop_cls_index] > 0.5:
+             classification_info = self.__printOverall(self.__hierachyCategoryList[sub_crop_cls_index], 5)
+             visitedList.append(self.__dictToStringOverall(classification_info))
+             positionList.append((box['x0_norm'],box['y0_norm'],box['x1_norm'],box['y1_norm']))
+             confidenceScore.append(sub_score_cls[sub_crop_cls_index])
+           elif sub_score_cls[sub_crop_cls_index] > 0.3:
+             classification_info = self.__printOverall(self.__hierachyCategoryList[sub_crop_cls_index], 1)
+             visitedList.append(self.__dictToStringOverall(classification_info))
+             positionList.append((box['x0_norm'],box['y0_norm'],box['x1_norm'],box['y1_norm']))
+             confidenceScore.append(sub_score_cls[sub_crop_cls_index])
+         
+       img_box_coco.append(box)
+        
+    #detection 200 category
+    maximumBoundingBox200Cat = 5
+    boundingBoxCounter200Cat = 0
+    curr_img_box_200 = []
+    predictions_detect_200 = predictions_detect_merge['detection_out']
+    for i in xrange(predictions_detect_200[0].shape[1]):
+      a_box = {'x0': int(predictions_detect_200[0][0,i,3] * width), 
+                 'y0': int(predictions_detect_200[0][0,i,4] * height), 
+                 'x1': int(predictions_detect_200[0][0,i,5] * width),  
+                 'y1': int(predictions_detect_200[0][0,i,6] * height), 
+                 's': predictions_detect_200[0][0,i,2], 
+                 'cat': int(predictions_detect_200[0][0,i,1]), 
+                 'x0_norm': predictions_detect_200[0][0,i,3], 
+                 'y0_norm': predictions_detect_200[0][0,i,4], 
+                 'x1_norm': predictions_detect_200[0][0,i,5],  
+                 'y1_norm': predictions_detect_200[0][0,i,6],
+                 }
+      if not self.__mergeBndBox(a_box, img_box_coco):
+        curr_img_box_200.append(a_box)
+
+    #need sort all boxes
+    curr_img_box_200.sort(key=lambda x:-x['s'])   
+    for box in curr_img_box_200:
+      if box['s'] < 0.6:
+         break
+      
+      if boundingBoxCounter200Cat == maximumBoundingBox200Cat:
+         break
+      boundingBoxCounter200Cat += 1
+
+      if box['s'] < self.__threshold_detect_200[box['cat']-1][1]:
+        continue
+
+      classification_info = self.__printOverall(self.__threshold_detect_200[box['cat']-1][0], 5)
+      visitedList.append(self.__dictToStringOverall(classification_info))
+      positionList.append((box['x0_norm'],box['y0_norm'],box['x1_norm'],box['y1_norm']))
+      confidenceScore.append(box['s'])
+    
+    
+    infoMap = []
+    for i in xrange(len(visitedList)):
+      infoMap.append((visitedList[i], positionList[i], float(confidenceScore[i])))
+    
+    hasPerson = True
+    if hasPerson and eventResult != '':
+      infoMap.append(eventResult)
+    
+    #rule for output tags
+    infoMap = self.__ruleForMonitor(infoMap)
+    infoMap = self.__ruleForViolin(infoMap)
+    
+    if len(infoMap)==0:
+      return ('None', feature)
+    return (infoMap, feature)
+
+  
+  def __dictToStringOverall(self, dictionary):
+    return dictionary["Overall"]
+  
+  def infoMap2String(self, infoMap):
+    if infoMap == 'None':
+      return 'None'
+    forest = CategoryForest.CategoryForest(infoMap)
+    return forest.printHierarchicalResult()
+  
+  def __printOverall(self, levelList, num):
+    classification_info = {}
+    if num == 0:
+      return classification_info
+    
+    if num <= len(levelList):
+      classification_info["Overall"] = levelList[0]
+      for i in xrange(1, num):
+        classification_info["Overall"] += '#' + levelList[i]
+    
+    if num > len(levelList) and len(levelList) > 0:
+      classification_info["Overall"] = levelList[0]
+      for i in xrange(1, len(levelList)):
+        classification_info["Overall"] += '#' + levelList[i]
+      
+    return classification_info
+      
+  def set_gpu_device(self, index):
+    if self.__mode == 'CPU':
+      raise Exception("'CPU' does not support such function.")
+    caffe.set_device(index)
+  
+  def getMaxGroupSize(self):
+    return __maxGroupSize
+    
+    
+  def displayImgGroups(self):
+    # mostly used for debug
+    print "__maxGroupSize: " + str(self.__maxGroupSize)
+    print "__maxGroupid: " + str(self.__maxGroupid)
+    print "__clusterFeatureNum: " + str(self.__clusterFeatureNum)
+    print "__time_interval: " + str(self.__time_interval)
+    print "__sim_thr_low: " + str(self.__sim_thr_low)
+    print "__sim_thr_high: " + str(self.__sim_thr_high)
+    imgGroupSize = len(self.__imgGroups)
+    print "imgGroupSize: " + str(imgGroupSize)
+    print
+    
+    for i in xrange(imgGroupSize):
+      print "Group Index: " + str(i)
+      print "cls_id: " + str(self.__imgGroups[i]["cls_id"])
+      print "listNum: " + str(self.__imgGroups[i]["listNum"])
+      print "ltime: " + str(self.__imgGroups[i]["ltime"])
+      print "updated: " + str(self.__imgGroups[i]["updated"])
+      print "centroid: " + str(self.__imgGroups[i]["centroid"])
+      print 
+    print "\n"
+
+  #merge duplicated tags    
+  def duplicateRemoval(self, visitedList):
+      for i in xrange(len(visitedList)):
+        for j in xrange(len(visitedList)):
+          if i != j and (visitedList[i][0] in visitedList[j][0]):
+            if visitedList[i][0] == visitedList[j][0] and visitedList[i][1] > visitedList[j][1]:
+              del visitedList[j]
+            else:
+              del visitedList[i]              
+            return (visitedList, True)
+      return (visitedList, False)
