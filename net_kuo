@@ -30,6 +30,13 @@ class CaffeNet:
         self.__net = caffe.Net(caffeProto_detect, # the structure of the model
                         caffeModel_detect, # contains the trained weights
                         caffe.TEST)
+                        
+        # input preprocessing: 'data' is the name of the input blob == net.inputs[0]
+        self.__transformer = caffe.io.Transformer({'data':self.__net.blobs['data'].data.shape})
+        self.__transformer.set_transpose('data', (2,0,1))
+        self.__transformer.set_mean('data', np.array([104,117,123])) # mean pixel
+        self.__transformer.set_raw_scale('data', 255)  # the reference model operates on images in [0,255] range instead of [0,1]  
+        self.__transformer.set_channel_swap('data', (2,1,0)) # the reference model has channels in BGR order instead of RGB 
 
         if mode == 'CPU':
             caffe.set_mode_cpu()
